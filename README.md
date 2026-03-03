@@ -8,6 +8,21 @@ It uses a **Temporal Knowledge Graph** (Neo4j), **FAISS vector search**, and a *
 
 ---
 
+## 📑 Table of Contents
+
+- [Key Features](#-key-features)
+- [Architecture](#️-architecture)
+- [Tech Stack](#️-tech-stack)
+- [Project Structure](#-project-structure)
+- [Getting Started](#-getting-started)
+- [Step-by-Step Execution Guide](#-step-by-step-execution-guide)
+- [How It Works](#-how-it-works)
+- [API Reference](#-api-reference)
+- [Testing](#-testing)
+- [References](#-references)
+
+---
+
 ## 🎯 Key Features
 
 - **Temporal Knowledge Graph** — 21K+ entities and 219K+ relationships stored in Neo4j with temporal metadata (start/end times, verification dates)
@@ -187,51 +202,141 @@ OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 ```
 
-### 3. Run the Data Pipeline
+---
+
+## 🗺️ Step-by-Step Execution Guide
+
+Follow these steps **in order** to build the full T-RAG system from scratch. Each step lists the script you run and which source modules it uses under the hood.
+
+### Step 1 — Data Pipeline: Fetch, Parse & Deduplicate
 
 ```bash
-# Fetch ICEWS18 dataset, parse, extract, deduplicate
-python scripts/preprocess_data.py --dataset icews18 --limit 2000
-
-# For the full dataset (~373K rows, takes ~30s):
 python scripts/preprocess_data.py --dataset icews18
 ```
 
-### 4. Build the Knowledge Graph
+| Order | Module invoked                                                      | What it does                                                                                                                                      |
+|:-----:|---------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1     | [`fetcher.py`](src/data_pipeline/fetcher.py)                        | Downloads ICEWS18 from RE-Net GitHub, fetches `entity2id.txt` and `relation2id.txt`, resolves numeric IDs to human-readable entity/relation names |
+| 2     | [`timestamp_parser.py`](src/data_pipeline/timestamp_parser.py)      | Converts day-index timestamps to ISO 8601 datetimes using dataset epoch offsets                                                                   |
+| 3     | [`entity_extractor.py`](src/data_pipeline/entity_extractor.py)      | Builds `(head, relation, tail, time)` quadruples, normalizes names, generates embedding-ready text                                                |
+| 4     | [`duplicate_resolver.py`](src/data_pipeline/duplicate_resolver.py)  | Groups by canonical key, merges overlapping time ranges, averages confidence scores                                                               |
 
-Make sure Neo4j Desktop is running with a database started, then:
+**Output:** `data/processed/facts_full.json` — 219,576 clean, deduplicated facts
+
+> 💡 Use `--limit 2000` for a quick test (produces ~1,800 facts in seconds).
+
+---
+
+### Step 2 — Build the Temporal Knowledge Graph in Neo4j
+
+> **Prerequisite:** Open Neo4j Desktop → create a project → create & **start** a database.
 
 ```bash
 python scripts/build_tkg.py --clear
 ```
 
-### 5. Generate Embeddings
+| Order | Module invoked                                        | What it does                                                                                  |
+|:-----:|-------------------------------------------------------|-----------------------------------------------------------------------------------------------|
+| 1     | [`neo4j_client.py`](src/tkg/neo4j_client.py)          | Connects to Neo4j via Bolt (`bolt://localhost:7687`), verifies health                         |
+| 2     | [`schema.py`](src/tkg/schema.py)                      | Applies uniqueness constraints, temporal indexes, and full-text search indexes                |
+| 3     | [`bulk_importer.py`](src/tkg/bulk_importer.py)        | Batch-creates Entity nodes (`MERGE`) and `RELATES_TO` relationships with temporal properties  |
+
+**Output:** Neo4j graph with **21,085 entity nodes** and **219,576 temporal relationships**
+
+> Schema reference: [`config/neo4j_schema.cypher`](config/neo4j_schema.cypher) — can also be run directly in Neo4j Browser.
+
+---
+
+### Step 3 — Generate Embeddings & Build FAISS Index
 
 ```bash
-# This downloads the SBERT model (~438 MB) on first run
 python scripts/generate_embeddings.py
 ```
 
-> ⏱️ This takes ~30 minutes on CPU for 30K facts. For faster results, use `--facts data/processed/facts.json` (1.8K facts, ~2 min).
+| Order | Module invoked                                       | What it does                                                                   |
+|:-----:|------------------------------------------------------|--------------------------------------------------------------------------------|
+| 1     | [`embedder.py`](src/data_pipeline/embedder.py)       | Loads Sentence-BERT (`all-mpnet-base-v2`, 768d), batch-encodes all fact texts  |
+| 2     | [`vector_search.py`](src/retriever/vector_search.py) | Normalizes vectors, builds a FAISS `IndexFlatIP` (cosine similarity)           |
 
-### 6. Launch the Demo
+**Output:** `data/embeddings/` containing:
+- `embeddings.npy` — raw vectors
+- `faiss_index.bin` — searchable FAISS index
+- `fact_ids.json` — ID → vector position mapping
+- `facts_meta.json` — full fact metadata for result enrichment
+
+> ⏱️ ~30 min on CPU for 30K facts. For a quick test: `--facts data/processed/facts.json` (~2 min for 1.8K facts).
+
+---
+
+### Step 4 — Launch the Application
+
+With Steps 1–3 complete, the system is fully operational. Choose either interface:
+
+#### Option A: Interactive Streamlit Demo
 
 ```bash
-# Interactive Streamlit UI
 streamlit run app.py
 ```
 
-Or start the REST API:
+The demo ([`app.py`](app.py)) loads these modules at runtime:
+
+| Module                                                         | Role in the demo                                                   |
+|----------------------------------------------------------------|--------------------------------------------------------------------|
+| [`query_encoder.py`](src/retriever/query_encoder.py)           | Encodes user query → 768d vector                                   |
+| [`vector_search.py`](src/retriever/vector_search.py)           | Searches FAISS index for top-50 candidates                         |
+| [`decay.py`](src/deprecation/decay.py)                         | Computes FVS for each candidate                                    |
+| [`temporal_filter.py`](src/retriever/temporal_filter.py)       | Removes facts outside the query time window                        |
+| [`wrs.py`](src/retriever/wrs.py)                               | Ranks by `α×Sim + (1-α)×FVS`, returns top-k                        |
+| [`context_assembler.py`](src/retriever/context_assembler.py)   | Formats ranked facts into numbered prompt context                  |
+| [`prompt_builder.py`](src/generator/prompt_builder.py)         | Wraps context into a time-aware system+user prompt                 |
+| [`llm_client.py`](src/generator/llm_client.py)                 | Calls OpenAI / Anthropic / local fallback                          |
+| [`post_processor.py`](src/generator/post_processor.py)         | Cleans LLM response (removes preambles, fixes whitespace)          |
+| [`consistency.py`](src/validator/consistency.py)               | Checks for future-date refs and unsupported claims                 |
+| [`confidence.py`](src/validator/confidence.py)                 | Computes composite confidence (consistency + freshness + coverage) |
+| [`neo4j_client.py`](src/tkg/neo4j_client.py)                   | Powers the "Explore" and "Graph" tabs                              |
+
+#### Option B: FastAPI REST API
 
 ```bash
 python -m uvicorn src.api.main:app --reload
-# API docs at http://localhost:8000/docs
+# Swagger docs → http://localhost:8000/docs
 ```
 
-### 7. Run Tests
+The API ([`src/api/main.py`](src/api/main.py)) uses [`orchestrator.py`](src/api/orchestrator.py) which chains all the above modules into a single async `process_query()` call.
+
+---
+
+### Step 5 — Run Tests
 
 ```bash
+# Run all 63 tests
 python -m pytest tests/ -v
+```
+
+| Test file                                               | Modules tested                                                                                                                                            | Count |
+|---------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|:-----:|
+| [`test_data_pipeline.py`](tests/test_data_pipeline.py)  | fetcher, timestamp_parser, entity_extractor, duplicate_resolver                                                                                           | 22    |
+| [`test_tkg.py`](tests/test_tkg.py)                      | neo4j_client, schema, bulk_importer *(requires running Neo4j)*                                                                                            | 10    |
+| [`test_modules.py`](tests/test_modules.py)              | decay, classifier, update_tracker, temporal_filter, wrs, context_assembler, prompt_builder, llm_client, post_processor, consistency, confidence, metrics  | 31    |
+
+---
+
+### Execution Summary
+
+```
+Step 1                 Step 2                    Step 3                     Step 4
+──────────────         ──────────────           ──────────────              ──────────────
+preprocess_data.py ──▶ build_tkg.py        ──▶ generate_embeddings.py ──▶ app.py
+  │                      │                        |                          │
+  ├─ fetcher.py          ├─ neo4j_client.py       │                          ├─ query_encoder
+  ├─ timestamp_parser    ├─ schema.py             ├─ embedder.py             ├─ vector_search
+  ├─ entity_extractor    └─ bulk_importer.py      └─ vector_search           ├─ decay / filter
+  └─ duplicate_resolver                                                      ├─ wrs / context
+                                                                             ├─ prompt_builder
+  Output:                Output:                   Output:                   ├─ llm_client
+  facts_full.json        Neo4j graph               FAISS index               └─ validator
+  (219K facts)           (21K nodes, 219K rels)    (768d vectors)
+                            
 ```
 
 ---
