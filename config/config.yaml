@@ -1,0 +1,67 @@
+# ===========================================
+# T-RAG System Configuration
+# ===========================================
+
+system:
+  name: "T-RAG"
+  version: "1.0.0"
+  environment: "development"
+
+# API Settings
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  timeout: 30
+
+# Database Configurations
+databases:
+  neo4j:
+    uri: "bolt://localhost:7687"
+    user: "neo4j"
+    password: "${NEO4J_PASSWORD}"
+
+  postgres:
+    uri: "postgresql://postgres:${POSTGRES_PASSWORD}@localhost:5432/trag"
+
+  redis:
+    url: "redis://localhost:6379/0"
+
+# Vector Search
+vector_search:
+  embedding_model: "sentence-transformers/all-mpnet-base-v2"
+  embedding_dim: 768
+  index_type: "IVFFlat"
+
+# Deprecation Detection
+deprecation:
+  default_lambda: 0.01
+  deprecation_threshold: 0.3
+  update_frequency: "daily"
+
+# Retrieval
+retrieval:
+  default_top_k: 5
+  max_top_k: 20
+  candidate_pool_size: 50
+  default_alpha: 0.5
+
+# LLM Generation
+llm:
+  provider: "openai"
+  model: "gpt-4"
+  max_tokens: 500
+  temperature: 0.7
+  api_key: "${OPENAI_API_KEY}"
+
+# Caching
+cache:
+  enabled: true
+  ttl: 3600
+  max_size: 10000
+
+# Logging
+logging:
+  level: "INFO"
+  format: "json"
+  file: "logs/trag.log"
