@@ -230,3 +230,272 @@ class TestDuplicateResolver:
         assert resolver.stats["total_input"] == 3
         assert resolver.stats["duplicates_removed"] == 2
         assert resolver.stats["output_count"] == 1
+
+
+# =====================================================================
+# DocumentLoader
+# =====================================================================
+
+from src.data_pipeline.document_loader import DocumentLoader
+
+
+class TestDocumentLoader:
+    def test_load_text(self, tmp_path):
+        f = tmp_path / "test.txt"
+        f.write_text("Hello world. This is a test document.", encoding="utf-8")
+        loader = DocumentLoader()
+        pages = loader.load_text(str(f))
+        assert len(pages) == 1
+        assert "Hello world" in pages[0]
+
+    def test_load_text_not_found(self):
+        loader = DocumentLoader()
+        with pytest.raises(FileNotFoundError):
+            loader.load_text("nonexistent.txt")
+
+    def test_load_autodetect_text(self, tmp_path):
+        f = tmp_path / "doc.md"
+        f.write_text("# Heading\nSome content.", encoding="utf-8")
+        loader = DocumentLoader()
+        pages = loader.load(str(f))
+        assert len(pages) == 1
+        assert "Heading" in pages[0]
+
+    def test_load_url_mocked(self):
+        from unittest.mock import patch, MagicMock
+
+        loader = DocumentLoader()
+        mock_resp = MagicMock()
+        mock_resp.text = """
+        <html><body>
+            <p>North Korea launched a missile on January 15, 2024.</p>
+            <p>The United Nations condemned the action immediately.</p>
+        </body></html>
+        """
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("requests.get", return_value=mock_resp):
+            pages = loader.load_url("https://example.com/article")
+            assert len(pages) == 1
+            assert "North Korea" in pages[0]
+
+
+# =====================================================================
+# TextChunker
+# =====================================================================
+
+from src.data_pipeline.text_chunker import TextChunker
+
+
+class TestTextChunker:
+    def test_short_text_no_split(self):
+        chunker = TextChunker(chunk_size=1000)
+        result = chunker.chunk("This is a short sentence.")
+        assert len(result) == 1
+
+    def test_long_text_splits(self):
+        # Create text longer than chunk_size
+        sentences = [f"Sentence number {i} is here." for i in range(50)]
+        text = " ".join(sentences)
+        chunker = TextChunker(chunk_size=200, overlap=50)
+        chunks = chunker.chunk(text)
+        assert len(chunks) > 1
+
+    def test_overlap_present(self):
+        sentences = [f"Sentence {i} about topic {i}." for i in range(30)]
+        text = " ".join(sentences)
+        chunker = TextChunker(chunk_size=200, overlap=80)
+        chunks = chunker.chunk(text)
+        # With overlap, some content should appear in consecutive chunks
+        if len(chunks) >= 2:
+            # Last words of chunk[0] should appear in chunk[1]
+            words_0 = set(chunks[0].split()[-5:])
+            words_1 = set(chunks[1].split()[:10])
+            assert len(words_0 & words_1) > 0
+
+    def test_empty_text(self):
+        chunker = TextChunker()
+        assert chunker.chunk("") == []
+        assert chunker.chunk("   ") == []
+
+    def test_chunk_pages(self):
+        chunker = TextChunker(chunk_size=500)
+        pages = ["Page one content here.", "Page two content here."]
+        chunks = chunker.chunk_pages(pages)
+        assert len(chunks) >= 1
+
+
+# =====================================================================
+# QuadrupleExtractor
+# =====================================================================
+
+from src.data_pipeline.quadruple_extractor import QuadrupleExtractor
+
+
+class TestQuadrupleExtractor:
+    def test_parse_valid_json(self):
+        extractor = QuadrupleExtractor(provider="local")
+        raw = '''[
+            {"head": "North Korea", "relation": "launched", "tail": "missile",
+             "date": "2024-01-15", "confidence": 0.9},
+            {"head": "United Nations", "relation": "condemned", "tail": "North Korea",
+             "date": "2024-01-16", "confidence": 0.85}
+        ]'''
+        facts = extractor._parse_response(raw)
+        assert len(facts) == 2
+        assert facts[0]["head"] == "North Korea"
+        assert facts[0]["relation"] == "launched"
+        assert facts[0]["confidence"] == 0.9
+        assert facts[0]["start_time"] is not None
+
+    def test_parse_with_markdown_fences(self):
+        extractor = QuadrupleExtractor(provider="local")
+        raw = '''```json
+        [{"head": "USA", "relation": "visited", "tail": "China",
+          "date": "2024-03-01", "confidence": 0.8}]
+        ```'''
+        facts = extractor._parse_response(raw)
+        assert len(facts) == 1
+        assert facts[0]["head"] == "Usa"  # title-cased
+
+    def test_parse_malformed_json(self):
+        extractor = QuadrupleExtractor(provider="local")
+        facts = extractor._parse_response("Not valid JSON at all")
+        assert len(facts) == 0
+
+    def test_parse_missing_fields(self):
+        extractor = QuadrupleExtractor(provider="local")
+        raw = '[{"head": "A", "relation": "", "tail": "B"}]'
+        facts = extractor._parse_response(raw)
+        assert len(facts) == 0  # empty relation should be dropped
+
+    def test_deduplicate(self):
+        facts = [
+            {"head": "USA", "relation": "visit", "tail": "China", "id": "1"},
+            {"head": "usa", "relation": "visit", "tail": "china", "id": "2"},
+            {"head": "Russia", "relation": "criticize", "tail": "NATO", "id": "3"},
+        ]
+        deduped = QuadrupleExtractor._deduplicate(facts)
+        assert len(deduped) == 2
+
+    def test_extract_mocked(self):
+        from unittest.mock import patch, MagicMock
+
+        extractor = QuadrupleExtractor(provider="local")
+        mock_response = '[{"head": "France", "relation": "signed treaty with", "tail": "Germany", "date": "2024-06-01", "confidence": 0.9}]'
+
+        with patch.object(extractor.llm, "generate", return_value=mock_response):
+            facts = extractor.extract("France signed a treaty with Germany in June 2024.")
+            assert len(facts) == 1
+            assert facts[0]["head"] == "France"
+
+
+# =====================================================================
+# GDELTFetcher
+# =====================================================================
+
+from src.data_pipeline.gdelt_fetcher import GDELTFetcher
+
+
+class TestGDELTFetcher:
+    def test_parse_gdelt_date(self):
+        result = GDELTFetcher._parse_gdelt_date("20240115T143000Z")
+        assert result is not None
+        assert "2024-01-15" in result
+
+    def test_parse_gdelt_date_empty(self):
+        assert GDELTFetcher._parse_gdelt_date("") is None
+        assert GDELTFetcher._parse_gdelt_date(None) is None
+
+    def test_parse_articles_with_mocked_llm(self):
+        from unittest.mock import patch, MagicMock
+
+        fetcher = GDELTFetcher()
+        articles = [
+            {
+                "title": "Russia sanctions Ukraine amid tensions",
+                "url": "https://example.com/1",
+                "domain": "example.com",
+                "seendate": "20240301T120000Z",
+                "language": "English",
+            },
+        ]
+
+        # Mock the QuadrupleExtractor to return a known fact
+        mock_facts = [{
+            "head": "Russia",
+            "relation": "sanctions",
+            "tail": "Ukraine",
+            "start_time": "2024-03-01T12:00:00+00:00",
+            "confidence": 0.9,
+            "source": "document",
+            "text": "Russia sanctions Ukraine",
+            "id": "doc_abc12345",
+        }]
+
+        with patch(
+            "src.data_pipeline.gdelt_fetcher.QuadrupleExtractor"
+        ) as MockExtractor:
+            mock_instance = MagicMock()
+            MockExtractor.return_value = mock_instance
+            mock_instance.extract.return_value = mock_facts
+            mock_instance._deduplicate.return_value = mock_facts
+
+            facts = fetcher._parse_articles(articles)
+            assert len(facts) >= 1
+            assert facts[0]["source"].startswith("GDELT")
+            assert facts[0]["id"].startswith("gdelt_")
+
+    def test_caching(self, tmp_path):
+        fetcher = GDELTFetcher(cache_dir=str(tmp_path))
+        key = fetcher._cache_key("test", 7, 100)
+
+        assert fetcher._load_cache(key) is None
+
+        test_facts = [{"head": "A", "relation": "r", "tail": "B"}]
+        fetcher._save_cache(key, test_facts)
+        loaded = fetcher._load_cache(key)
+        assert loaded == test_facts
+
+    def test_fetch_recent_mocked(self):
+        from unittest.mock import patch, MagicMock
+
+        fetcher = GDELTFetcher(cache_dir="data/cache/gdelt_test")
+        mock_response = {
+            "articles": [
+                {
+                    "title": "NATO condemns Russia over missile strike",
+                    "url": "https://example.com/article",
+                    "domain": "example.com",
+                    "seendate": "20240315T100000Z",
+                    "language": "English",
+                },
+            ]
+        }
+
+        mock_facts = [{
+            "head": "Nato",
+            "relation": "condemns",
+            "tail": "Russia",
+            "start_time": "2024-03-15",
+            "confidence": 0.85,
+            "source": "document",
+            "text": "NATO condemns Russia",
+            "id": "doc_xyz",
+        }]
+
+        with patch.object(fetcher, "_api_request", return_value=mock_response):
+            with patch.object(fetcher, "_load_cache", return_value=None):
+                with patch.object(fetcher, "_save_cache"):
+                    with patch(
+                        "src.data_pipeline.gdelt_fetcher.QuadrupleExtractor"
+                    ) as MockExtractor:
+                        mock_inst = MagicMock()
+                        MockExtractor.return_value = mock_inst
+                        mock_inst.extract.return_value = mock_facts
+                        mock_inst._deduplicate.return_value = mock_facts
+
+                        facts = fetcher.fetch_recent(query="NATO", days_back=7)
+                        assert isinstance(facts, list)
+                        assert len(facts) >= 1
+

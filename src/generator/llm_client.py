@@ -1,6 +1,6 @@
 """
 Module 5.2 — LLM Client for T-RAG Generator.
-Supports OpenAI, Anthropic, and a local fallback mode.
+Supports OpenAI, Anthropic, Ollama (local inference), and a template fallback.
 """
 
 import logging
@@ -17,7 +17,11 @@ class LLMClient:
     """
     Multi-provider LLM client with retry logic.
 
-    Supported providers: 'openai', 'anthropic', 'local' (template-based fallback).
+    Supported providers:
+        - 'ollama'    — Local inference via Ollama (OpenAI-compatible API)
+        - 'openai'    — OpenAI GPT models (requires API key)
+        - 'anthropic' — Anthropic Claude models (requires API key)
+        - 'local'     — Template-based fallback (no model, no API key)
     """
 
     def __init__(
@@ -32,16 +36,25 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.temperature = temperature
 
-        if self.provider == "openai":
+        if self.provider == "ollama":
+            self.model = model or os.getenv("OLLAMA_MODEL", "qwen2:0.5b")
+            self.api_base = os.getenv(
+                "OLLAMA_BASE_URL", "http://localhost:11434/v1"
+            )
+            self.api_key = "ollama"  # Ollama ignores this but SDK requires it
+        elif self.provider == "openai":
             self.model = model or "gpt-4"
             self.api_key = os.getenv("OPENAI_API_KEY", "")
+            self.api_base = None
         elif self.provider == "anthropic":
             self.model = model or "claude-3-haiku-20240307"
             self.api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            self.api_base = None
         else:
             self.provider = "local"
             self.model = "local-template"
             self.api_key = ""
+            self.api_base = None
 
     # ── Generate ──────────────────────────────────────────────────────
 
@@ -59,12 +72,32 @@ class LLMClient:
         Returns:
             Generated text string.
         """
-        if self.provider == "openai":
+        if self.provider == "ollama":
+            return self._generate_ollama(messages)
+        elif self.provider == "openai":
             return self._generate_openai(messages)
         elif self.provider == "anthropic":
             return self._generate_anthropic(messages)
         else:
             return self._generate_local(messages)
+
+    def _generate_ollama(self, messages: List[Dict[str, str]]) -> str:
+        """Generate via Ollama's OpenAI-compatible API."""
+        import openai
+
+        client = openai.OpenAI(
+            base_url=self.api_base,
+            api_key=self.api_key,
+        )
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+        )
+        text = response.choices[0].message.content.strip()
+        logger.info(f"Ollama response: {len(text)} chars, model={self.model}")
+        return text
 
     def _generate_openai(self, messages: List[Dict[str, str]]) -> str:
         import openai
@@ -138,8 +171,24 @@ class LLMClient:
     # ── Health ─────────────────────────────────────────────────────────
 
     def health_check(self) -> Dict[str, Any]:
-        return {
+        result = {
             "provider": self.provider,
             "model": self.model,
             "has_api_key": bool(self.api_key),
         }
+
+        if self.provider == "ollama":
+            try:
+                import httpx
+
+                # Ollama's native API (not the /v1 compat layer)
+                base = self.api_base.replace("/v1", "")
+                resp = httpx.get(f"{base}/api/tags", timeout=3)
+                models = [m["name"] for m in resp.json().get("models", [])]
+                result["status"] = "healthy"
+                result["available_models"] = models
+            except Exception as e:
+                result["status"] = "unreachable"
+                result["error"] = str(e)
+
+        return result

@@ -1,10 +1,10 @@
 """
 Module 5.1 — Prompt Builder for T-RAG LLM Generator.
-Creates time-aware prompts with structured context.
+Creates time-aware prompts with structured context and conflict awareness.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -14,10 +14,16 @@ class PromptBuilder:
     """Builds time-aware prompts for LLM generation."""
 
     SYSTEM_PROMPT = (
-        "You are a helpful assistant specialising in temporally-accurate information. "
-        "Answer based ONLY on the provided context. "
-        "Always cite timestamps when stating facts. "
-        "If the context is insufficient, say so honestly."
+        "You are a geopolitical analysis assistant that provides temporally-accurate answers. "
+        "You answer questions based ONLY on the retrieved factual context provided to you.\n\n"
+        "Rules:\n"
+        "1. ONLY use information from the provided context — never invent facts.\n"
+        "2. Always cite dates when mentioning events (e.g., 'In January 2018, ...').\n"
+        "3. If facts conflict, acknowledge both and prefer the most recent one.\n"
+        "4. If a fact is marked [OUTDATED], note that it may no longer be current.\n"
+        "5. If the context is insufficient, say: 'The available evidence does not cover this.'\n"
+        "6. Use past tense for events with end dates, present tense for ongoing facts.\n"
+        "7. Keep your answer concise but informative."
     )
 
     def build_prompt(
@@ -28,20 +34,23 @@ class PromptBuilder:
     ) -> str:
         """Build a complete prompt with query, context, and instructions."""
         if query_time is None:
-            query_time = datetime.utcnow()
+            query_time = datetime.now(timezone.utc)
+
+        time_str = query_time.strftime("%Y-%m-%d %H:%M UTC")
 
         return f"""Question: {query}
 
-Context (valid as of {query_time.strftime('%Y-%m-%d %H:%M UTC')}):
+Reference Time: {time_str}
+
+Retrieved Context:
 {context}
 
 Instructions:
-- Use ONLY the provided context to answer
-- Prioritise facts marked "to present" (most current)
-- If conflicting facts exist, prefer the most recent
-- State "I don't have current information" if context is insufficient
-- Always include source citations with timestamps
-- Use appropriate tenses (past events in past tense)
+- Answer the question using ONLY the facts above.
+- Cite dates and sources from the context.
+- Facts marked [OUTDATED] may no longer be current — mention this caveat.
+- If conflicting facts exist, discuss both and explain which is more recent.
+- If context is insufficient, state that clearly.
 
 Answer:"""
 

@@ -51,6 +51,97 @@ class TestDecayFunction:
         assert scored[0]["fvs"] > 0.99
         assert scored[1]["fvs"] == 0.0
 
+    def test_per_relation_lambda(self):
+        """Test that calculate_fvs uses per-relation λ when available."""
+        from unittest.mock import MagicMock
+        d = DecayFunction(default_lambda=0.01)
+        # Mock relation rates
+        d._relation_rates = MagicMock()
+        d._relation_rates.get_lambda.return_value = 0.1  # 10x faster decay
+
+        now = datetime(2024, 6, 15, tzinfo=timezone.utc)
+        old = now - timedelta(days=30)
+
+        fvs_default = d.calculate_fvs(old, now)  # no relation → default_lambda
+        fvs_fast = d.calculate_fvs(old, now, relation="sanctions")
+
+        # With 10x faster λ, the fact should decay much more
+        assert fvs_fast < fvs_default
+
+    def test_score_facts_with_start_time_fallback(self):
+        """Test that score_facts falls back to start_time when last_verified is None."""
+        d = DecayFunction()
+        now = datetime(2024, 6, 15, tzinfo=timezone.utc)
+        facts = [
+            {
+                "last_verified": None,
+                "start_time": (now - timedelta(days=5)).isoformat(),
+                "relation": "sanctions",
+            },
+        ]
+        scored = d.score_facts(facts, now)
+        assert scored[0]["fvs"] > 0.0
+        assert scored[0]["fvs"] < 1.0
+
+
+class TestRelationDecayRates:
+    def test_learn_rates_basic(self, tmp_path):
+        from src.deprecation.decay import RelationDecayRates
+
+        rates_path = str(tmp_path / "test_rates.json")
+        learner = RelationDecayRates(rates_path=rates_path)
+
+        # Create facts with known intervals
+        now = datetime(2024, 6, 15, tzinfo=timezone.utc)
+        facts = [
+            {"relation": "sanctions", "start_time": (now - timedelta(days=30)).isoformat()},
+            {"relation": "sanctions", "start_time": (now - timedelta(days=20)).isoformat()},
+            {"relation": "sanctions", "start_time": (now - timedelta(days=10)).isoformat()},
+            {"relation": "sanctions", "start_time": now.isoformat()},
+            {"relation": "visits", "start_time": (now - timedelta(days=100)).isoformat()},
+            {"relation": "visits", "start_time": (now - timedelta(days=50)).isoformat()},
+            {"relation": "visits", "start_time": now.isoformat()},
+        ]
+        rates = learner.learn_rates(facts)
+
+        assert "sanctions" in rates
+        assert "visits" in rates
+        # Sanctions updates every ~10 days → higher λ
+        # Visits updates every ~50 days → lower λ
+        assert rates["sanctions"] > rates["visits"]
+
+    def test_learn_rates_insufficient_data(self, tmp_path):
+        from src.deprecation.decay import RelationDecayRates
+
+        learner = RelationDecayRates(rates_path=str(tmp_path / "rates.json"))
+        facts = [
+            {"relation": "rare_event", "start_time": "2024-01-01"},
+            {"relation": "rare_event", "start_time": "2024-06-01"},
+        ]
+        rates = learner.learn_rates(facts, default_lambda=0.05)
+        # Only 2 data points → should use default
+        assert rates["rare_event"] == 0.05
+
+    def test_get_lambda_fallback(self, tmp_path):
+        from src.deprecation.decay import RelationDecayRates
+
+        learner = RelationDecayRates(rates_path=str(tmp_path / "rates.json"))
+        learner.rates = {"sanctions": 0.1}
+        assert learner.get_lambda("sanctions") == 0.1
+        assert learner.get_lambda("unknown_relation", default=0.02) == 0.02
+
+    def test_persistence(self, tmp_path):
+        from src.deprecation.decay import RelationDecayRates
+
+        rates_path = str(tmp_path / "persist.json")
+        learner = RelationDecayRates(rates_path=rates_path)
+        learner.rates = {"test": 0.05}
+        learner._save()
+
+        # Load in a new instance
+        loaded = RelationDecayRates(rates_path=rates_path)
+        assert loaded.rates["test"] == 0.05
+
 
 class TestDeprecationClassifier:
     def test_fresh_fact_valid(self):
@@ -213,6 +304,52 @@ class TestLLMClient:
         assert health["provider"] == "local"
 
 
+class TestLLMClientOllama:
+    def test_ollama_init(self):
+        llm = LLMClient(provider="ollama")
+        assert llm.provider == "ollama"
+        assert llm.model == "llama3"  # default
+        assert "11434" in llm.api_base
+        assert llm.api_key == "ollama"
+
+    def test_ollama_custom_model(self):
+        llm = LLMClient(provider="ollama", model="phi3")
+        assert llm.model == "phi3"
+
+    def test_ollama_health_check(self):
+        llm = LLMClient(provider="ollama")
+        health = llm.health_check()
+        assert health["provider"] == "ollama"
+        assert health["model"] == "llama3"
+        # Status will be "unreachable" if Ollama isn't running
+        assert "status" in health
+
+    def test_ollama_generate_mocked(self):
+        """Verify Ollama calls OpenAI SDK with correct base_url."""
+        from unittest.mock import patch, MagicMock
+
+        llm = LLMClient(provider="ollama", model="llama3")
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Test answer from Ollama"
+
+        with patch("openai.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.return_value = mock_response
+
+            msgs = [{"role": "user", "content": "Hello"}]
+            answer = llm.generate(msgs)
+
+            # Verify correct base_url was passed
+            mock_openai.assert_called_once_with(
+                base_url=llm.api_base,
+                api_key="ollama",
+            )
+            assert answer == "Test answer from Ollama"
+
+
 class TestPostProcessor:
     def test_remove_preamble(self):
         pp = PostProcessor()
@@ -287,3 +424,78 @@ class TestEvaluationMetrics:
         preds = ["In 2024, X happened"]
         gts = ["2024"]
         assert calculate_temporal_accuracy(preds, gts) == 1.0
+
+
+class TestBenchmarkData:
+    def test_benchmark_queries_exist(self):
+        from src.evaluation.benchmark_data import BENCHMARK_QUERIES
+        assert len(BENCHMARK_QUERIES) >= 10
+        for q in BENCHMARK_QUERIES:
+            assert "id" in q
+            assert "query" in q
+            assert "query_date" in q
+            assert "category" in q
+
+    def test_benchmark_categories(self):
+        from src.evaluation.benchmark_data import BENCHMARK_QUERIES
+        categories = set(q["category"] for q in BENCHMARK_QUERIES)
+        assert len(categories) >= 3  # at least 3 categories
+
+
+class TestUpgradedContextAssembler:
+    def test_conflict_detection(self):
+        from src.retriever.context_assembler import ContextAssembler
+        ca = ContextAssembler()
+        facts = [
+            {"head": "USA", "tail": "China", "relation": "sanctions",
+             "text": "USA sanctions China", "start_time": "2024-01-01"},
+            {"head": "USA", "tail": "China", "relation": "cooperates with",
+             "text": "USA cooperates with China", "start_time": "2024-03-01"},
+        ]
+        context = ca.format(facts)
+        assert len(ca.conflicts) >= 1
+        assert "conflict" in context.lower() or "⚠" in context
+
+    def test_empty_facts(self):
+        from src.retriever.context_assembler import ContextAssembler
+        ca = ContextAssembler()
+        context = ca.format([])
+        assert "No relevant facts" in context
+
+    def test_entity_summary(self):
+        from src.retriever.context_assembler import ContextAssembler
+        ca = ContextAssembler()
+        facts = [
+            {"head": "Russia", "tail": "Ukraine", "relation": "invades",
+             "text": "Russia invades Ukraine", "start_time": "2022-02-24"},
+        ]
+        context = ca.format(facts)
+        assert "Russia" in context
+        assert "Ukraine" in context
+
+
+class TestUpgradedPostProcessor:
+    def test_temporal_normalization(self):
+        from src.generator.post_processor import PostProcessor
+        pp = PostProcessor()
+        text = "The event on 2024-01-15T14:30:00+00:00 was significant."
+        result = pp.process(text)
+        assert "2024-01-15" in result
+        assert "T14:30" not in result
+
+    def test_staleness_warning(self):
+        from src.generator.post_processor import PostProcessor
+        pp = PostProcessor()
+        stale_facts = [{"fvs": 0.1, "confidence": 0.3}]
+        result = pp.process("Some answer text.", source_facts=stale_facts)
+        assert "Caution" in result or "⚠" in result
+
+    def test_no_warning_for_fresh(self):
+        from src.generator.post_processor import PostProcessor
+        pp = PostProcessor()
+        fresh_facts = [
+            {"fvs": 0.9, "confidence": 0.8},
+            {"fvs": 0.85, "confidence": 0.75},
+        ]
+        result = pp.process("Some answer text.", source_facts=fresh_facts)
+        assert "Caution" not in result

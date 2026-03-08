@@ -106,6 +106,51 @@ class VectorSearch:
 
         return results
 
+    # ── Incremental update ───────────────────────────────────────────
+
+    def append_to_index(
+        self,
+        new_embeddings: np.ndarray,
+        new_fact_ids: List[str],
+        new_facts: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """
+        Add new vectors to the existing FAISS index.
+
+        Args:
+            new_embeddings: (M, dim) float32 array of new vectors.
+            new_fact_ids: Parallel list of new fact IDs.
+            new_facts: Optional full fact dicts for metadata.
+
+        Returns:
+            Number of new vectors added.
+        """
+        import faiss
+
+        if self._index is None:
+            # No existing index — build one from scratch
+            self.build_index(new_embeddings, new_fact_ids, new_facts)
+            return len(new_fact_ids)
+
+        assert new_embeddings.shape[1] == self.dim, (
+            f"Embedding dim {new_embeddings.shape[1]} != expected {self.dim}"
+        )
+
+        embeddings = new_embeddings.astype("float32").copy()
+        faiss.normalize_L2(embeddings)
+        self._index.add(embeddings)
+        self._fact_ids.extend(new_fact_ids)
+
+        if new_facts:
+            for fact in new_facts:
+                self._facts_meta[fact["id"]] = fact
+
+        logger.info(
+            f"Appended {len(new_fact_ids)} vectors to index "
+            f"(total: {self._index.ntotal})"
+        )
+        return len(new_fact_ids)
+
     # ── Persistence ──────────────────────────────────────────────────
 
     def save(self, output_dir: str = "data/embeddings") -> None:

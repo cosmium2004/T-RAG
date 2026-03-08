@@ -11,6 +11,25 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 
+# Fixes WinError 1114 on some Windows environments
+import os
+import ctypes
+if os.name == 'nt':
+    try:
+        # Pre-load the problematic PyTorch DLLs manually
+        import site
+        site_packages = site.getsitepackages()[0]
+        torch_lib_dir = os.path.join(site_packages, "torch", "lib")
+        
+        if os.path.exists(torch_lib_dir):
+            os.add_dll_directory(torch_lib_dir)
+            ctypes.CDLL(os.path.join(torch_lib_dir, "c10.dll"))
+            ctypes.CDLL(os.path.join(torch_lib_dir, "fbgemm.dll"))
+            ctypes.CDLL(os.path.join(torch_lib_dir, "torch_cpu.dll"))
+    except Exception as e:
+        print(f"Warning: Failed to preload PyTorch DLLs: {e}")
+
+import torch
 import streamlit as st
 
 # Project root
@@ -189,9 +208,17 @@ with st.sidebar:
 
     llm_provider = st.selectbox(
         "LLM Provider",
-        ["local", "openai", "anthropic"],
-        help="'local' = template-based, no API key needed",
+        ["ollama", "local", "openai", "anthropic"],
+        help="'ollama' = local model via Ollama, 'local' = template fallback",
     )
+
+    ollama_model = "qwen2:0.5b"
+    if llm_provider == "ollama":
+        ollama_model = st.text_input(
+            "Ollama Model",
+            value="qwen2:0.5b",
+            help="Model name (e.g. qwen2:0.5b, phi3, mistral, gemma:2b)",
+        )
 
     st.divider()
 
@@ -224,8 +251,8 @@ with st.sidebar:
 
 # ── Main query area ──────────────────────────────────────────────────
 
-tab_query, tab_explore, tab_graph = st.tabs([
-    "🔍 Query", "📊 Explore Facts", "🌐 Graph View"
+tab_query, tab_explore, tab_graph, tab_ingest = st.tabs([
+    "🔍 Query", "📊 Explore Facts", "🌐 Graph View", "📄 Ingest"
 ])
 
 
@@ -283,7 +310,7 @@ with tab_query:
 
                 pb = PromptBuilder()
                 messages = pb.build_messages(query, context, query_time)
-                llm = LLMClient(provider=llm_provider)
+                llm = LLMClient(provider=llm_provider, model=ollama_model)
                 raw_answer = llm.generate(messages)
                 pp = PostProcessor()
                 answer = pp.process(raw_answer)
@@ -439,3 +466,120 @@ with tab_graph:
                 st.caption(f"Showing {len(all_edges)} connections for '{entity}'")
             else:
                 st.warning(f"No connections found for '{entity}'")
+
+
+# ── Ingest tab ───────────────────────────────────────────────────────
+
+with tab_ingest:
+    st.header("📄 Document Ingestion")
+    st.markdown(
+        "Upload a document or enter a URL. T-RAG will extract temporal "
+        "knowledge quadruples and add them to the search index."
+    )
+
+    col_file, col_url = st.columns(2)
+    with col_file:
+        uploaded_file = st.file_uploader(
+            "Upload Document", type=["txt", "pdf", "md"],
+            help="PDF, TXT, or Markdown files",
+        )
+    with col_url:
+        url_input = st.text_input(
+            "Or enter a URL",
+            placeholder="https://example.com/article",
+        )
+
+    if st.button("🔍 Extract Quadruples", type="primary", key="extract_btn"):
+        source_text = None
+        source_name = "document"
+
+        if uploaded_file:
+            from src.data_pipeline.document_loader import DocumentLoader
+            import tempfile
+            import os
+
+            # Save uploaded file temporarily
+            suffix = "." + uploaded_file.name.rsplit(".", 1)[-1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(uploaded_file.getvalue())
+                tmp_path = tmp.name
+
+            loader = DocumentLoader()
+            with st.spinner("Loading document..."):
+                pages = loader.load(tmp_path)
+            os.unlink(tmp_path)
+            source_name = uploaded_file.name
+
+        elif url_input:
+            from src.data_pipeline.document_loader import DocumentLoader
+            loader = DocumentLoader()
+            with st.spinner("Fetching URL..."):
+                pages = loader.load_url(url_input)
+            source_name = url_input
+
+        else:
+            st.warning("Please upload a file or enter a URL.")
+            pages = None
+
+        if pages:
+            from src.data_pipeline.text_chunker import TextChunker
+            from src.data_pipeline.quadruple_extractor import QuadrupleExtractor
+
+            with st.spinner("Chunking text..."):
+                chunker = TextChunker(chunk_size=1000, overlap=200)
+                chunks = chunker.chunk_pages(pages)
+                st.info(f"Created {len(chunks)} text chunks")
+
+            with st.spinner(f"Extracting facts using {llm_provider}..."):
+                extractor = QuadrupleExtractor(
+                    provider=llm_provider, model=ollama_model,
+                )
+                facts = extractor.extract_from_document(
+                    chunks, source_name=source_name,
+                )
+
+            if facts:
+                st.success(f"Extracted {len(facts)} unique facts!")
+
+                # Show facts table
+                import pandas as pd
+                df = pd.DataFrame([
+                    {
+                        "Head": f["head"],
+                        "Relation": f["relation"],
+                        "Tail": f["tail"],
+                        "Date": f.get("start_time", "N/A"),
+                        "Confidence": f.get("confidence", 0.0),
+                    }
+                    for f in facts
+                ])
+                st.dataframe(df, use_container_width=True)
+
+                # Store in session for indexing
+                st.session_state["extracted_facts"] = facts
+            else:
+                st.warning("No facts could be extracted from the document.")
+
+    # Index button (separate from extraction)
+    if "extracted_facts" in st.session_state and st.session_state["extracted_facts"]:
+        if st.button("📦 Index Facts into FAISS", key="index_btn"):
+            from src.data_pipeline.embedder import Embedder
+
+            facts = st.session_state["extracted_facts"]
+            with st.spinner("Generating embeddings and updating index..."):
+                embedder = Embedder()
+                embeddings = embedder.embed_facts(facts)
+                fact_ids = [f["id"] for f in facts]
+
+                vs = load_vector_search()
+                if vs:
+                    added = vs.append_to_index(embeddings, fact_ids, facts)
+                    vs.save("data/embeddings")
+                    st.success(
+                        f"✅ Added {added} facts to index "
+                        f"(total: {vs.size} vectors)"
+                    )
+                else:
+                    st.error("FAISS index not available.")
+
+            st.session_state["extracted_facts"] = []
