@@ -31,6 +31,7 @@ if os.name == 'nt':
 
 import torch
 import streamlit as st
+import pandas as pd
 
 # Project root
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -283,51 +284,80 @@ with tab_query:
 
             with st.spinner("Processing query through T-RAG pipeline..."):
                 t0 = time.time()
+                timing_stats = {}
 
                 # Pipeline steps
                 progress = st.progress(0, text="Encoding query...")
+                
+                t_start = time.time()
                 encoder = load_query_encoder()
                 query_vec = encoder.encode(query)
+                timing_stats["Query Encoding"] = time.time() - t_start
+                
                 progress.progress(20, text="Searching FAISS index...")
 
+                t_start = time.time()
                 candidates = vs.search(query_vec, top_n=50)
+                timing_stats["Vector Search"] = time.time() - t_start
+                
                 progress.progress(40, text="Calculating FVS scores...")
 
+                t_start = time.time()
                 decay = DecayFunction(default_lambda=lambda_val)
                 decay.score_facts(candidates, query_time, threshold)
+                timing_stats["Decay Scoring"] = time.time() - t_start
 
+                t_start = time.time()
                 tf = TemporalFilter(deprecation_threshold=threshold)
                 valid = tf.filter(candidates, query_time)
+                timing_stats["Temporal Filtering"] = time.time() - t_start
+                
                 progress.progress(55, text="Ranking by WRS...")
 
+                t_start = time.time()
                 wrs = WRSScorer(alpha=alpha)
                 ranked = wrs.rank(valid, top_k=top_k)
+                timing_stats["WRS Ranking"] = time.time() - t_start
+                
                 progress.progress(70, text="Assembling context...")
 
+                t_start = time.time()
                 ca = ContextAssembler()
                 context = ca.format(ranked, query_time)
+                timing_stats["Context Assembly"] = time.time() - t_start
+                
                 progress.progress(80, text="Generating answer...")
 
+                t_start = time.time()
                 pb = PromptBuilder()
                 messages = pb.build_messages(query, context, query_time)
                 llm = LLMClient(provider=llm_provider, model=ollama_model)
                 raw_answer = llm.generate(messages)
+                timing_stats["LLM Generation"] = time.time() - t_start
+                
+                t_start = time.time()
                 pp = PostProcessor()
                 answer = pp.process(raw_answer)
+                timing_stats["Post-Processing"] = time.time() - t_start
+                
                 progress.progress(90, text="Validating response...")
 
+                t_start = time.time()
                 cv = ConsistencyValidator()
                 validation = cv.validate(answer, query_time, ranked)
+                timing_stats["Consistency Validation"] = time.time() - t_start
+                
+                t_start = time.time()
                 cs = ConfidenceScorer()
                 confidence = cs.score(validation, ranked)
+                timing_stats["Confidence Scoring"] = time.time() - t_start
 
                 latency = int((time.time() - t0) * 1000)
                 progress.progress(100, text="Done!")
                 time.sleep(0.3)
                 progress.empty()
 
-            # ── Results ──────────────────────────────────────────
-
+            # Results
             st.markdown("---")
 
             # Metrics row
@@ -347,7 +377,7 @@ with tab_query:
             c3.markdown(
                 f'<div class="stat-card"><div class="stat-value">'
                 f'{latency}ms</div>'
-                f'<div class="stat-label">Latency</div></div>',
+                f'<div class="stat-label">Total Latency</div></div>',
                 unsafe_allow_html=True,
             )
             rating = confidence["rating"]
@@ -361,6 +391,16 @@ with tab_query:
 
             st.markdown("### 💬 Answer")
             st.markdown(answer)
+
+            # Latency breakdown
+            with st.expander("⏱️ Latency Breakdown"):
+                timing_df = pd.DataFrame(
+                    list(timing_stats.items()), 
+                    columns=['Step', 'Time (s)']
+                )
+                timing_df['Time (ms)'] = (timing_df['Time (s)'] * 1000).astype(int)
+                timing_df = timing_df.drop('Time (s)', axis=1)
+                st.dataframe(timing_df, use_container_width=True)
 
             # Confidence breakdown
             with st.expander("📊 Confidence Breakdown"):
